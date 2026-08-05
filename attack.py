@@ -184,14 +184,16 @@ def build_zip(src_root, out_zip, base_zip, extra_dir, version_override, old_vers
                          os.path.join(src_root, name)])
         if p:
             data, notes = patch_uap(open(p, "rb").read(), name)
-            for n in notes:
-                print(f"[PATCH] {n}")
-            entries[zpath] = data
         elif zpath in entries:
-            print(f"[WARN] {name}: no source copy — keeping BASE version (UNPATCHED)")
+            # fall back: patch the base-zip bytes themselves (they ARE the original firmware)
+            data, notes = patch_uap(entries[zpath], name)
+            notes = ["BASE fallback: " + n for n in notes]
         else:
             print(f"[FAIL] {name}: missing in base AND source")
             return None
+        for n in notes:
+            print(f"[PATCH] {n}")
+        entries[zpath] = data
 
     # --- 3. sysctl.bin is NEVER part of the payload ---
     #     The updater fetches it per-serial from VersionHistory.zip (server side,
@@ -208,6 +210,8 @@ def build_zip(src_root, out_zip, base_zip, extra_dir, version_override, old_vers
             for f in files:
                 full = os.path.join(root, f)
                 rel = os.path.relpath(full, extra_dir).replace("\\", "/")
+                if not rel.startswith("MSDIAG/"):  # keep payload clean
+                    continue
                 entries[rel] = open(full, "rb").read()
                 added += 1
         print(f"[EXTRA] {added} entries appended from {extra_dir}")
@@ -530,8 +534,9 @@ def main():
     ap.add_argument("--source-dir", default=None, help="dir containing MSDIAG/ tree (for UAP patch sources)")
     ap.add_argument("--base-zip", default=os.path.join(SCRIPT_DIR, "original_from_aliyun.zip"),
                     help="original V20CRPRO_SYSTEM.zip used as structural base")
-    ap.add_argument("--extra-dir", default=os.path.join(SCRIPT_DIR, "extra"),
-                    help="dir whose content is appended as zip entries (e.g. patched MSDIAG/MAKES/...)")
+    ap.add_argument("--extra-dir", default=None,
+                    help="dir whose content is appended as zip entries (e.g. patched MSDIAG/MAKES/...; "
+                         "default: extra/ next to this script, else SCRIPT_DIR itself)")
     ap.add_argument("--out-zip", default=os.path.join(SCRIPT_DIR, ZIP_NAME), help="output zip path")
     ap.add_argument("--port", type=int, default=9191, help="local redirect server port")
     ap.add_argument("--card", default="E:", help="card drive for read-back verification")
@@ -548,7 +553,17 @@ def main():
 
     src_root = args.source_dir or discover_source_root()
 
-    zip_path = build_zip(src_root, args.out_zip, args.base_zip, args.extra_dir,
+    # extra dir auto-detect: extra/ preferred, else SCRIPT_DIR if it holds MSDIAG/MAKES
+    extra_dir = args.extra_dir
+    if not extra_dir:
+        if os.path.isdir(os.path.join(SCRIPT_DIR, "extra", "MSDIAG", "MAKES")):
+            extra_dir = os.path.join(SCRIPT_DIR, "extra")
+        elif os.path.isdir(os.path.join(SCRIPT_DIR, "MSDIAG", "MAKES")):
+            extra_dir = SCRIPT_DIR
+        else:
+            extra_dir = os.path.join(SCRIPT_DIR, "extra")
+
+    zip_path = build_zip(src_root, args.out_zip, args.base_zip, extra_dir,
                          None, "V23.02")
     if not zip_path:
         return 1
