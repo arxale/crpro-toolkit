@@ -3,10 +3,11 @@ import frida, sys, os, time
 
 UPDATER = r"C:\Program Files (x86)\iCarsoft\iCarsoft_MSDIAG_PCClientKits\iCarsoft_MSDIAG_PCClientKits.exe"
 
-HOOK = r"""
+HOOK = """
 var k32 = Process.findModuleByName('kernel32.dll');
 var wf = k32.findExportByName('WriteFile');
-var ntwf = Module.findExportByName('ntdll.dll', 'NtWriteFile');
+var ntdll = Process.findModuleByName('ntdll.dll');
+var ntwf = ntdll ? ntdll.findExportByName('NtWriteFile') : null;
 var totalWrites = 0;
 var handles = {};
 var handleCounts = {};
