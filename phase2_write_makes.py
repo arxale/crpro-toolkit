@@ -82,6 +82,8 @@ def find_source():
 def main():
     ap = argparse.ArgumentParser(description="Patch FuncCfg.bin on the mounted card (BMW/BENZ coding)")
     ap.add_argument("--card", default=CARD, help="card drive (default E:)")
+    ap.add_argument("--check", action="store_true",
+                    help="only list what's on the card (no writes): VDBs, FuncCfg, license, Menu")
     ap.add_argument("--full", action="store_true",
                     help="DANGER: also write Menu/ScanCfg/SetLink/license from the dump "
                          "(only if you know they match the current updater state)")
@@ -107,6 +109,40 @@ def main():
     if not os.path.isdir(makes_dst):
         print(f"[FAIL] {makes_dst} existiert nicht auf der Karte")
         return 1
+
+    # --- CHECK MODE: inventory of the card (no writes) ---
+    if args.check:
+        print("\n[CHECK] Inventar der Karte (MSDIAG/MAKES):")
+        for brand in sorted(os.listdir(makes_dst)):
+            bpath = os.path.join(makes_dst, brand)
+            if not os.path.isdir(bpath):
+                continue
+            for ver in sorted(os.listdir(bpath)):
+                vpath = os.path.join(bpath, ver)
+                if not os.path.isdir(vpath):
+                    continue
+                print(f"\n  [{brand}/{ver}]")
+                for f in sorted(os.listdir(vpath)):
+                    fp = os.path.join(vpath, f)
+                    if os.path.isfile(fp):
+                        sz = os.path.getsize(fp)
+                        mark = ""
+                        if f.lower() == "license.dat":
+                            m = md5_file(fp)
+                            mark = f"  md5={m[:16]}..."
+                        if f.lower() == "funcfg.bin":
+                            try:
+                                d = open(fp, "rb").read()
+                                if brand == "BMW":
+                                    c = count_bmw_slots(d)
+                                else:
+                                    c = count_benz_slots(d)
+                                mark = f"  ungepatchte Slots: {c}"
+                            except Exception:
+                                pass
+                        print(f"    {f:<20} {sz:>12,} B{mark}")
+        print("\n[CHECK] Ende. Fehlt BMW_DE.vdb o.ä.? -> im Updater Marke mit Sprache DE erneut herunterladen.")
+        return 0
 
     # cleanup stray .bak files from the previous phase2 run
     for root, dirs, files in os.walk(makes_dst):
