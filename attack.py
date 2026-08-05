@@ -156,7 +156,7 @@ def patch_uap(data, name):
 # ---------------------------------------------------------------------------
 # 1. ZIP build — the concrete payload
 # ---------------------------------------------------------------------------
-def build_zip(src_root, out_zip, base_zip, extra_dir, version_override, old_version):
+def build_zip(src_root, out_zip, base_zip, extra_dir, include_extra, version_override, old_version):
     print("=" * 62)
     print("[BUILD] Forging V20CRPRO_SYSTEM.zip (system package, softCode S0002880)")
     print("=" * 62)
@@ -204,7 +204,11 @@ def build_zip(src_root, out_zip, base_zip, extra_dir, version_override, old_vers
             print("[SYSCTL] removed from payload — server supplies the original via VersionHistory.zip")
 
     # --- 4. Extra dir: patched make data (MSDIAG/MAKES/... tree) ---
-    if extra_dir and os.path.isdir(extra_dir):
+    #     NOTE: by default we keep the system zip EXACTLY 29 entries (the structure
+    #     the updater knows). Patched makes are written DIRECTLY to the card in
+    #     phase 2 (write_makes_direct), NOT embedded in the zip — embedding them
+    #     previously caused the updater to stall mid-extraction.
+    if include_extra and extra_dir and os.path.isdir(extra_dir):
         added = 0
         for root, dirs, files in os.walk(extra_dir):
             for f in files:
@@ -214,9 +218,9 @@ def build_zip(src_root, out_zip, base_zip, extra_dir, version_override, old_vers
                     continue
                 entries[rel] = open(full, "rb").read()
                 added += 1
-        print(f"[EXTRA] {added} entries appended from {extra_dir}")
+        print(f"[EXTRA] {added} entries appended from {extra_dir} (in-zip; normally phase-2 direct)")
     else:
-        print("[EXTRA] none")
+        print("[EXTRA] none (makes go to card in phase 2)")
 
     # --- 5. Write zip (base order preserved, extras appended) ---
     if os.path.exists(out_zip):
@@ -340,13 +344,17 @@ class ZipServer:
 HOOK_JS = r"""
 var k32 = Process.findModuleByName('kernel32.dll');
 var wininet = Process.findModuleByName('WININET.dll') || Process.findModuleByName('wininet.dll');
+var user32 = Process.findModuleByName('user32.dll');
 
 var REDIR  = 'http://127.0.0.1:__PORT__/V20CRPRO_SYSTEM.zip';
 var redirW = Memory.allocUtf16String(REDIR);
 var redirA = Memory.allocUtf8String(REDIR);
 var hooked = false;
 var handlePath = {};
-var stat = {redirects: 0, eWrites: 0, uapWrites: 0, sysctlWrites: 0, misses: 0};
+var stat = {redirects: 0, eWrites: 0, uapWrites: 0, sysctlWrites: 0, misses: 0, zipWrites: 0};
+var pathCounts = {};          // path -> write count
+var lastWrite = 0;            // monotonic ms of last E: write
+var dialogShown = 0;
 
 function log(m) { send({t: 'log', m: m}); }
 
@@ -379,49 +387,28 @@ function hookAll() {
         log('HOOK ' + nm + ' installed');
     });
 
-    // ===== OPTIONAL: MFC CHttpFile path (InternetConnectW + HttpOpenRequestW) =====
-    if (__HOOK_CONNECT__) {
-        var icw = wininet.findExportByName('InternetConnectW');
-        if (icw) Interceptor.attach(icw, {
-            onEnter: function (a) {
-                var srv = a[1].isNull() ? null : a[1].readUtf16String();
-                if (!srv) return;
-                var t = srv.toLowerCase();
-                if (t === '127.0.0.1' || t === 'localhost') return;
-                var allowed = false;
-                for (var i = 0; i < __API_HOSTS__.length; i++)
-                    if (t.indexOf(__API_HOSTS__[i].toLowerCase()) !== -1) { allowed = true; break; }
-                if (allowed) return;
-                a[1] = redirW;   // host name; port stays (server binds 127.0.0.1:port)
-                send({t: 'connect-redirect', from: srv});
-            }
-        });
-        var horw = wininet.findExportByName('HttpOpenRequestW');
-        if (horw) Interceptor.attach(horw, {
-            onEnter: function (a) {
-                var obj = a[2].isNull() ? null : a[2].readUtf16String();
-                if (obj && isTargetUrl(obj)) {
-                    a[2] = Memory.allocUtf16String('/' + ZIP_NAME_JS);
-                    send({t: 'log', m: 'HttpOpenRequestW object rewritten: ' + obj});
+    // ===== DIALOGS: any MessageBox the updater shows (error/confirm waits) =====
+    if (user32) {
+        ['MessageBoxW', 'MessageBoxA', 'MessageBoxExW', 'MessageBoxExA'].forEach(function (nm) {
+            var fn = user32.findExportByName(nm);
+            if (!fn) return;
+            Interceptor.attach(fn, {
+                onEnter: function (a) {
+                    var t = a[0].isNull() ? '' : a[0].readUtf16String();
+                    var c = a[1].isNull() ? '' : a[1].readUtf16String();
+                    if (nm.indexOf('A') >= 0) {
+                        t = a[0].isNull() ? '' : a[0].readUtf8String();
+                        c = a[1].isNull() ? '' : a[1].readUtf8String();
+                    }
+                    dialogShown++;
+                    send({t: 'dialog', text: t, caption: c});
                 }
-            }
+            });
         });
-        log('HOOK connect-path installed');
-    } else {
-        // observe-only: tell the user if the CHttpFile path was used
-        var horw2 = wininet.findExportByName('HttpOpenRequestW');
-        if (horw2) Interceptor.attach(horw2, {
-            onEnter: function (a) {
-                var obj = a[2].isNull() ? null : a[2].readUtf16String();
-                if (obj && isTargetUrl(obj)) {
-                    stat.misses++;
-                    log('MISSED-REDIRECT: HttpOpenRequestW(' + obj + ') — rerun with --hook-connect');
-                }
-            }
-        });
+        log('HOOK MessageBox installed');
     }
 
-    // ===== EVIDENCE: updater writes to E: (UAP/sysctl/EDBSFD/VDATA/devinfo) =====
+    // ===== ALL E: writes with path counting + return values =====
     var cfw = k32.findExportByName('CreateFileW');
     Interceptor.attach(cfw, {
         onEnter: function (a) {
@@ -435,17 +422,18 @@ function hookAll() {
     });
     var wf = k32.findExportByName('WriteFile');
     Interceptor.attach(wf, {
-        onEnter: function (a) { this.h = a[0].toInt32(); this.sz = a[2].toInt32(); },
+        onEnter: function (a) { this.h = a[0].toInt32(); this.sz = a[2].toInt32(); this.ret = a[3]; },
         onLeave: function () {
             var path = handlePath[this.h] || '';
-            var lp = path.toLowerCase();
-            if (lp.indexOf('e:\\') >= 0 &&
-                (lp.indexOf('uap_') >= 0 || lp.indexOf('sysctl') >= 0 ||
-                 lp.indexOf('edbsfd') >= 0 || lp.indexOf('vdata') >= 0 || lp.indexOf('devinfo') >= 0)) {
+            if (path.indexOf('E:\\') >= 0 || path.indexOf('E:') >= 0) {
                 stat.eWrites++;
+                pathCounts[path] = (pathCounts[path] || 0) + 1;
+                lastWrite = Date.now();
+                var lp = path.toLowerCase();
                 if (lp.indexOf('uap_') >= 0) stat.uapWrites++;
                 if (lp.indexOf('sysctl') >= 0) stat.sysctlWrites++;
-                if (stat.eWrites <= 60) log('E:WRITE ' + path + ' sz=' + this.sz);
+                if (lp.indexOf('v20crpro_system.zip') >= 0 || lp.indexOf('.zip') >= 0) stat.zipWrites++;
+                send({t: 'ewrite', path: path, sz: this.sz});
             }
         }
     });
@@ -528,6 +516,37 @@ def verify_card(card):
     return all(results) if results else None
 
 
+def write_makes_direct(card, extra_dir, version_override, old_version):
+    """Phase 2: write patched make data DIRECTLY onto the mounted card
+    (E: in upgrade mode), after the updater is done. The bootloader flashes
+    E: -> internal on reboot, so files written here land in the device."""
+    print("\n[PHASE2] Writing patched make data directly to card...")
+    if not extra_dir or not os.path.isdir(extra_dir):
+        print("[PHASE2] no extra dir — nothing to write")
+        return False
+    makes_dst = os.path.join(card, "MSDIAG", "MAKES")
+    if not os.path.isdir(makes_dst):
+        print(f"[PHASE2] {makes_dst} not found — card not mounted as E:?")
+        return False
+    written = 0
+    for root, dirs, files in os.walk(extra_dir):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, extra_dir).replace("\\", "/")
+            if not rel.startswith("MSDIAG/MAKES/"):
+                continue
+            dst = os.path.join(card, rel.replace("/", os.sep))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            data = open(full, "rb").read()
+            if version_override and old_version and f == "FuncCfg.bin":
+                data = data.replace(old_version.encode(), version_override.encode())
+            open(dst, "wb").write(data)
+            written += 1
+            print(f"[PHASE2] wrote {rel} ({len(data):,} B)")
+    print(f"[PHASE2] {written} files written to card")
+    return written > 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="CR Pro firmware-substitution attack (vector D)")
     ap.add_argument("--updater", default=UPDATER_DEFAULT, help="path to iCarsoft updater exe")
@@ -545,9 +564,11 @@ def main():
     ap.add_argument("--hook-connect", action="store_true", help="also redirect InternetConnectW/HttpOpenRequestW path")
     ap.add_argument("--api-host", action="append", default=[], help="host NOT to redirect (repeatable)")
     ap.add_argument("--dry-run", action="store_true", help="build + self-test zip only, no frida")
+    ap.add_argument("--phase2", action="store_true", help="ONLY write patched makes directly to card (skip frida/redirect)")
+    ap.add_argument("--with-makes", action="store_true", help="embed makes in zip (default: phase-2 direct write)")
     args = ap.parse_args()
 
-    if frida is None and not args.dry_run:
+    if frida is None and not args.dry_run and not args.phase2:
         print("[FAIL] frida module not installed on this machine. Install: pip install frida-tools")
         return 2
 
@@ -563,8 +584,25 @@ def main():
         else:
             extra_dir = os.path.join(SCRIPT_DIR, "extra")
 
+    # --- PHASE-2-ONLY mode: write patched makes directly to the mounted card ---
+    if args.phase2:
+        print("=" * 62)
+        print("[PHASE2] Writing patched make data directly to card (no redirect)")
+        print("=" * 62)
+        ok = write_makes_direct(args.card, extra_dir, None, "V23.02")
+        card_result = verify_card(args.card)
+        if ok and card_result is True:
+            print("\n[PHASE2] VERIFIED — card holds MOD!-patched UAP + original sysctl + patched makes. Update will flash.")
+            return 0
+        elif ok:
+            print("\n[PHASE2] makes written, but card verification incomplete.")
+            return 1
+        else:
+            print("\n[PHASE2] no makes written (card not mounted?).")
+            return 1
+
     zip_path = build_zip(src_root, args.out_zip, args.base_zip, extra_dir,
-                         None, "V23.02")
+                         args.with_makes, None, "V23.02")
     if not zip_path:
         return 1
     if args.dry_run:
@@ -599,8 +637,12 @@ def main():
 
     script = session.create_script(build_js(args.port, args.hook_connect, args.api_host))
     stats = {"redirects": 0, "eWrites": 0, "uapWrites": 0, "sysctlWrites": 0}
+    write_log = []  # (path, sz) — full sequence
+    seen_paths = {}
+    last_activity = time.time()
 
     def on_message(message, data):
+        nonlocal last_activity
         if message["type"] == "send":
             p = message["payload"]
             t = p.get("t", "")
@@ -609,15 +651,23 @@ def main():
                 print(f"[REDIRECT] #{stats['redirects']} {p['from']}")
             elif t == "connect-redirect":
                 print(f"[CONNECT] host -> 127.0.0.1:{args.port} (was: {p['from']})")
+            elif t == "dialog":
+                print(f"[DIALOG] *** Updater zeigt Dialog: '{p.get('text','')}' (Caption: {p.get('caption','')})")
+            elif t == "ewrite":
+                path = p.get("path", "")
+                sz = p.get("sz", 0)
+                stats["eWrites"] += 1
+                if "UAP_" in path.upper():
+                    stats["uapWrites"] += 1
+                if "sysctl" in path.lower():
+                    stats["sysctlWrites"] += 1
+                write_log.append((path, sz))
+                seen_paths[path] = seen_paths.get(path, 0) + 1
+                last_activity = time.time()
+                # print every write but de-dupe repeated paths in STATUS
+                print(f"[E:WRITE] {path} sz={sz}")
             elif t == "log":
-                m = p.get("m", "")
-                if m.startswith("E:WRITE"):
-                    stats["eWrites"] += 1
-                    if "UAP_" in m:
-                        stats["uapWrites"] += 1
-                    if "sysctl" in m:
-                        stats["sysctlWrites"] += 1
-                print(f"[HOOK] {m}")
+                print(f"[HOOK] {p.get('m','')}")
         elif message["type"] == "error":
             print(f"[SCRIPT-ERR] {message.get('description', message)}")
 
@@ -628,21 +678,30 @@ def main():
         resumed = True
     print("\n>>> Login + trigger 'V20CRPRO_SYSTEM' download in the updater. Waiting for evidence... <<<\n")
 
-    # ---- wait for evidence: the FLASH TRIGGER is sysctl.bin written LAST ----
-    # (updater fetches it per-serial from VersionHistory.zip — NOT redirected —
-    #  and writes it after all UAPs; without it the bootloader will not flash)
+    # ---- wait for evidence ----
+    # sysctl.bin written LAST = flash trigger (comes from VersionHistory.zip, NOT redirected).
+    # UAPs written = extraction happened. If writes stop for 45s without sysctl -> likely a dialog/error.
     deadline = time.time() + args.timeout
     last_status = 0
     trigger_ok = False
+    all_uaps = False
+    idle_reached = False
     while time.time() < deadline:
         time.sleep(1)
         if time.time() - last_status > 20:
             last_status = time.time()
             print(f"[STATUS] redirects={stats['redirects']} eWrites={stats['eWrites']} "
-                  f"(uap={stats['uapWrites']} sysctl={stats['sysctlWrites']}) served={server.served}")
+                  f"(uap={stats['uapWrites']} sysctl={stats['sysctlWrites']}) served={server.served} "
+                  f"idle={int(time.time()-last_activity)}s")
         if stats["redirects"] >= 1 and stats["sysctlWrites"] >= 1:
-            time.sleep(3)  # let the updater finish the remaining writes
+            time.sleep(3)
             trigger_ok = True
+            break
+        if stats["uapWrites"] >= 1:
+            all_uaps = True
+        # if writes went silent for 45s after any activity, stop waiting (report + phase 2)
+        if stats["eWrites"] > 0 and time.time() - last_activity > 45:
+            idle_reached = True
             break
 
     print("\n" + "=" * 62)
@@ -653,11 +712,16 @@ def main():
               f"sysctl={stats['sysctlWrites']} TRIGGER OK)")
         print(f"  - forged zip served: {server.served}x requests, {server.served_bytes:,} bytes")
         verdict = 0
-    elif stats["redirects"] >= 1 and stats["eWrites"] >= 1:
+    elif stats["redirects"] >= 1 and all_uaps:
         print("ATTACK PARTIAL — UAPs written but sysctl.bin TRIGGER NOT observed")
         print("  sysctl.bin is the flash trigger; without it the bootloader will NOT flash.")
-        print("  Do NOT unplug yet — the updater may still be processing (watch the log),")
-        print("  or rerun the whole flow with a longer --timeout.")
+        print("  Check for a dialog/error in the updater window, then rerun with a longer --timeout,")
+        print("  or unplug + reboot only if you accept the card contents as-is.")
+        verdict = 1
+    elif stats["redirects"] >= 1 and stats["eWrites"] >= 1:
+        print("ATTACK PARTIAL — E: writes started but NO UAPs and NO sysctl trigger")
+        print("  The updater stopped early (likely a dialog/error — watch the updater window).")
+        print("  Do NOT unplug yet; check the updater screen and click through any prompt.")
         verdict = 1
     elif stats["redirects"] >= 1:
         print("ATTACK PARTIAL — download redirected but no E: writes observed")
@@ -670,12 +734,22 @@ def main():
         print("  - if the download uses HttpOpenRequestW: rerun with --hook-connect --api-host <login-host>")
         verdict = 1
 
+    # write sequence summary (unique paths + counts)
+    print("\n[WRITE-SEQ] unique E: paths written (count):")
+    for path, cnt in sorted(seen_paths.items()):
+        print(f"    {cnt:>4}x  {path}")
+
     card_result = verify_card(args.card)
     if card_result is True:
         print("[CARD] VERIFIED — card holds MOD!-patched UAP + original sysctl. Update will flash.")
     elif card_result is False:
         print("[CARD] VERIFY FAILED — read-back mismatch! Do NOT reboot the device into update; investigate.")
         verdict = 1
+
+    # --- PHASE 2: write patched makes directly to the card ---
+    if not args.with_makes:
+        write_makes_direct(args.card, extra_dir, None, "V23.02")
+        print("\nNEXT STEP: unplug USB, restart device. Bootloader flashes the new UAP set + patched makes (sysctl trigger).")
 
     print("\nNEXT STEP: unplug USB, restart device. Bootloader flashes the new UAP set (sysctl trigger).")
     print("           For STM32 RDP/firmware dump, that requires the hardware/JTAG path — out of scope here.")
